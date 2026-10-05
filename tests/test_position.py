@@ -11,8 +11,8 @@ can = pytest.importorskip("can")
 sdk = pytest.importorskip("robstride_dynamics")
 pytest.importorskip("robstride_dynamics.protocol")
 
-from robstride_dynamics import lab_position as diagnostic
-from robstride_dynamics.lab_position import ReadOnlyPositionReader
+from robstride_dynamics import position as diagnostic
+from robstride_dynamics.position import PositionReader
 
 RobstrideBus = sdk.RobstrideBus
 
@@ -100,7 +100,7 @@ def setup(monkeypatch):
     for name in ("__init__", "scan_channel", "enable", "disable", "write",
                  "transmit", "disconnect"):
         monkeypatch.setattr(RobstrideBus, name, forbidden)
-    reader = ReadOnlyPositionReader("fake-can", motor_id=1)
+    reader = PositionReader("fake-can", motor_id=1)
     yield reader, transport, clock, factory_calls
     reader.close()
 
@@ -145,7 +145,7 @@ def test_public_api_and_exact_read_only_request(setup):
 
 def test_custom_host_motor_and_bitrate(setup):
     _, transport, _, calls = setup
-    reader = ReadOnlyPositionReader("fake-can", motor_id=7, bitrate=500000, host_id=3)
+    reader = PositionReader("fake-can", motor_id=7, bitrate=500000, host_id=3)
     reader.connect()
     transport.replies = [reply(motor=7, host=3)]
     try:
@@ -371,8 +371,8 @@ def test_lifecycle_and_no_destructor_motor_commands(setup):
     reader.connect()
     with pytest.raises(RuntimeError, match="Already connected"):
         reader.connect()
-    assert "__del__" not in ReadOnlyPositionReader.__dict__
-    other = ReadOnlyPositionReader("fake-can", motor_id=1)
+    assert "__del__" not in PositionReader.__dict__
+    other = PositionReader("fake-can", motor_id=1)
     other.connect()
     del other
     gc.collect()
@@ -402,7 +402,7 @@ def test_invalid_configuration_no_transport_open(setup, kwargs):
     args = {"channel": "fake-can", "motor_id": 1}
     args.update(kwargs)
     with pytest.raises((ValueError, TypeError)):
-        ReadOnlyPositionReader(**args)
+        PositionReader(**args)
     assert not calls and not transport.sent
 
 

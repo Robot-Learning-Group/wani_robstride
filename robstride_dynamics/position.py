@@ -14,7 +14,7 @@ import can
 from .protocol import CommunicationType, ParameterType
 
 
-class ReadOnlyPositionReader:
+class PositionReader:
     """Read raw mechanical position (radians), without changing motor state.
 
     Only type-17 reads of register 0x7019 are sent. No RobstrideBus instance,

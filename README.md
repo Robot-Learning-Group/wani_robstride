@@ -54,11 +54,11 @@ explicitly; the original package exports are unchanged.
 ### Read-only mechanical position
 
 ```python
-from robstride_dynamics.lab_position import ReadOnlyPositionReader
+from robstride_dynamics.position import PositionReader
 
 # Only execute after supporting the robot, providing a physical power cutoff,
 # establishing that the selected motor is disabled, and stopping other controllers.
-reader = ReadOnlyPositionReader(channel="can0", motor_id=26)
+reader = PositionReader(channel="can0", motor_id=26)
 try:
     reader.connect()
     raw_position_rad = reader.read_position(timeout_s=0.1)
