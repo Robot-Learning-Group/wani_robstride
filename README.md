@@ -44,6 +44,53 @@ pip install -e .
 The SDK requires Python ≥ 3.10 and depends only on `numpy`, `python-can`,
 and `tqdm`.
 
+## Lab-owned additions (separate from the original API)
+
+This Lab fork tracks official SDK updates. Original APIs, including
+`RobstrideBus.read()`, `connect()`, and `disconnect()`, are unchanged.
+Lab-specific communication features live in separate modules and are imported
+explicitly; the original package exports are unchanged.
+
+### Read-only mechanical position
+
+```python
+from robstride_dynamics.lab_position import ReadOnlyPositionReader
+
+# Only execute after supporting the robot, providing a physical power cutoff,
+# establishing that the selected motor is disabled, and stopping other controllers.
+reader = ReadOnlyPositionReader(channel="can0", motor_id=26)
+try:
+    reader.connect()
+    raw_position_rad = reader.read_position(timeout_s=0.1)
+    print(raw_position_rad)
+finally:
+    reader.close()
+```
+
+The reader sends only Private type-17 reads of `MECHANICAL_POSITION` (`0x7019`).
+It does not scan, enable, disable, zero, change modes, or send control targets.
+It does **not** establish that the motor is disabled or stop a running motor.
+Position is raw motor radians, not calibrated robot joint position.
+
+- One monotonic deadline covers bounded queue draining, send and receive.
+  Transport calls must honor their timeouts; opening/closing are not hard-bounded.
+- Motor/host/register, frame format, finite position, and target fault reports
+  are checked. Concurrent operations are rejected, not queued.
+- Failed requests require explicit close/reconnect. Close detaches the transport
+  before shutdown, and no destructor sends motor commands.
+- The protocol has no transaction ID: delayed replies to identical requests
+  cannot be perfectly excluded. Stop other controllers/readers during testing.
+- No physical device/driver/firmware validation has been performed.
+
+Hardware-free tests (in a virtual environment with this checkout and pytest installed):
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests
+```
+
+Maintain and test these additive modules separately when incorporating official
+updates; do not silently alter the original APIs to make Lab behavior the default.
+
 ## Hardware setup
 
 1. Wire the motor's CAN bus to a SocketCAN-compatible adapter (e.g. the
