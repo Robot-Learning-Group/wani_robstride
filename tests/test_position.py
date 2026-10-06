@@ -47,7 +47,8 @@ class FakeTransport:
         self.clock.now += self.send_cost
         if self.send_error:
             raise self.send_error
-        self.queued.extend(self.replies)
+        replies = self.replies(frame) if callable(self.replies) else self.replies
+        self.queued.extend(replies)
 
     def recv(self, timeout):
         self.received.append(timeout)
@@ -116,6 +117,8 @@ def assert_poisoned(reader, transport):
     counts = (len(transport.sent), len(transport.received))
     with pytest.raises(RuntimeError, match="Failed session"):
         reader.read_position()
+    with pytest.raises(RuntimeError, match="Failed session"):
+        reader.read_settings()
     with pytest.raises(RuntimeError, match="Already connected"):
         reader.connect()
     assert counts == (len(transport.sent), len(transport.received))
@@ -429,7 +432,8 @@ def test_concurrent_operations_rejected_without_poisoning(setup):
     thread.start()
     try:
         assert entered.wait(2), "test worker did not enter receive"
-        for operation in (reader.read_position, reader.connect, reader.close):
+        for operation in (reader.read_position, reader.read_settings,
+                          reader.connect, reader.close):
             with pytest.raises(RuntimeError, match="in progress"):
                 operation()
         assert len(transport.sent) == 1
@@ -441,3 +445,201 @@ def test_concurrent_operations_rejected_without_poisoning(setup):
     assert errors == [] and results == [1.25]
     transport.recv_hook = None
     assert reader.read_position() == 1.25
+
+
+SETTINGS = (
+    ("run_mode", 0x7005, "<B", 5),
+    ("velocity_limit_rad_s", 0x7017, "<f", 12.5),
+    ("current_limit_a", 0x7018, "<f", 3.25),
+    ("torque_limit_nm", 0x700B, "<f", 1.5),
+    ("can_timeout_raw", 0x7028, "<I", 0xFEDCBA98),
+    ("zero_state", 0x7029, "<B", 1),
+    ("raw_motor_position_rad", 0x7019, "<f", -2.5),
+)
+
+
+def settings_reply(register, format, value):
+    frame = reply(register=register)
+    # Nonzero unused bytes prove uint8 decoding consumes only one byte.
+    payload = struct.pack(format, value).ljust(4, b"\xa5")
+    frame.data = bytearray(struct.pack("<HH", register, 0) + payload)
+    return frame
+
+
+def connect_settings(setup, overrides=None):
+    reader, transport, _, _ = setup
+    overrides = overrides or {}
+
+    def respond(request):
+        parameter, = struct.unpack_from("<H", request.data)
+        for key, register, format, value in SETTINGS:
+            if parameter == register:
+                return [settings_reply(register, format, overrides.get(key, value))]
+        pytest.fail(f"Unexpected register 0x{parameter:04x}")
+
+    transport.replies = respond
+    reader.connect()
+    return reader, transport
+
+
+def test_settings_keys_types_sequence_endianness_and_read_only_close(setup):
+    reader, transport = connect_settings(setup)
+    result = reader.read_settings()
+    assert list(result) == [key for key, _, _, _ in SETTINGS]
+    assert result == {key: value for key, _, _, value in SETTINGS}
+    for key, _, format, _ in SETTINGS:
+        assert type(result[key]) is (float if format == "<f" else int)
+    assert result["can_timeout_raw"] > 2**31
+    assert len(transport.sent) == 7
+    for (frame, timeout), (_, register, _, _) in zip(transport.sent, SETTINGS):
+        assert frame.arbitration_id == 0x1100FF01
+        assert frame.data == struct.pack("<HHL", register, 0, 0)
+        assert frame.is_extended_id and frame.dlc == 8
+        assert not (frame.is_fd or frame.is_remote_frame or frame.is_error_frame)
+        assert timeout == pytest.approx(0.1)
+    reader.close()
+    reader.close()
+    assert transport.shutdown_calls == 1
+    assert len(transport.sent) == 7
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2, 3, 5])
+@pytest.mark.parametrize("zero_state", [0, 1])
+def test_supported_mode_and_zero_state(setup, mode, zero_state):
+    reader, _ = connect_settings(setup, {"run_mode": mode, "zero_state": zero_state})
+    result = reader.read_settings()
+    assert result["run_mode"] == mode
+    assert result["zero_state"] == zero_state
+
+
+@pytest.mark.parametrize("key,value,count,message", [
+    ("run_mode", 4, 1, "Unsupported run_mode raw value: 4"),
+    ("run_mode", 255, 1, "Unsupported run_mode raw value: 255"),
+    ("zero_state", 2, 6, "Unsupported zero_state raw value: 2"),
+    ("zero_state", 255, 6, "Unsupported zero_state raw value: 255"),
+    ("velocity_limit_rad_s", -0.5, 2, "Negative velocity_limit_rad_s"),
+    ("current_limit_a", -0.5, 3, "Negative current_limit_a"),
+    ("torque_limit_nm", -0.5, 4, "Negative torque_limit_nm"),
+])
+def test_invalid_settings_stop_without_partial_success_and_poison(
+    setup, key, value, count, message
+):
+    reader, transport = connect_settings(setup, {key: value})
+    with pytest.raises(ValueError, match=message):
+        reader.read_settings()
+    assert len(transport.sent) == count
+    assert_poisoned(reader, transport)
+
+
+@pytest.mark.parametrize("key", ["velocity_limit_rad_s", "current_limit_a",
+                                 "torque_limit_nm", "raw_motor_position_rad"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_settings_nonfinite_float_fails_and_poisons(setup, key, value):
+    reader, transport = connect_settings(setup, {key: value})
+    with pytest.raises(ValueError, match="Nonfinite"):
+        reader.read_settings()
+    assert len(transport.sent) == next(
+        index for index, (name, _, _, _) in enumerate(SETTINGS, 1) if name == key
+    )
+    assert_poisoned(reader, transport)
+
+
+@pytest.mark.parametrize("raw_timeout", [0, 0x01020304, 0xFFFFFFFF])
+def test_zero_limits_and_raw_uint32_timeout_no_defaults(setup, raw_timeout):
+    reader, _ = connect_settings(setup, {
+        "velocity_limit_rad_s": 0.0, "current_limit_a": 0.0,
+        "torque_limit_nm": 0.0, "can_timeout_raw": raw_timeout,
+    })
+    result = reader.read_settings()
+    assert result["can_timeout_raw"] == raw_timeout
+    assert result["velocity_limit_rad_s"] == 0.0
+    assert result["current_limit_a"] == 0.0
+    assert result["torque_limit_nm"] == 0.0
+
+
+def test_settings_each_register_has_separate_deadline(setup):
+    reader, transport = connect_settings(setup)
+    clock = setup[2]
+    transport.recv_cost = 0.09
+    start = clock.now
+    assert reader.read_settings(timeout_s=0.1)["run_mode"] == 5
+    assert clock.now - start == pytest.approx(7 * 0.09)
+    assert [timeout for _, timeout in transport.sent] == pytest.approx([0.1] * 7)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "transport", "malformed", "fault"])
+def test_settings_failure_halfway_poisoned_until_reconnect(setup, failure):
+    reader, transport = connect_settings(setup)
+    respond = transport.replies
+
+    def fail_halfway(request):
+        parameter, = struct.unpack_from("<H", request.data)
+        if parameter != 0x700B:
+            return respond(request)
+        if failure == "timeout":
+            return []
+        if failure == "transport":
+            raise can.CanOperationError("halfway failure")
+        if failure == "malformed":
+            return [reply(register=parameter, dlc=7)]
+        frame = reply(kind=21)
+        frame.data = bytearray(struct.pack("<LL", 4, 1))
+        return [frame]
+
+    transport.replies = fail_halfway
+    error = {"timeout": TimeoutError, "transport": can.CanOperationError,
+             "malformed": ValueError, "fault": RuntimeError}[failure]
+    with pytest.raises(error):
+        reader.read_settings()
+    assert len(transport.sent) == 4
+    assert_poisoned(reader, transport)
+    reader.close()
+    reader.connect()
+    transport.replies = respond
+    assert reader.read_settings()["torque_limit_nm"] == 1.5
+    assert len(transport.sent) == 11
+    assert all(frame.arbitration_id >> 24 == 17 for frame, _ in transport.sent)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"),
+                                     -float("inf"), None, "0.1", True])
+def test_settings_invalid_timeout_does_not_poison_or_touch_transport(setup, timeout):
+    reader, transport = connect_settings(setup)
+    with pytest.raises((TypeError, ValueError), match="timeout_s"):
+        reader.read_settings(timeout_s=timeout)
+    assert not transport.sent and not transport.received
+    assert reader.read_settings()["run_mode"] == 5
+
+
+def test_settings_rejects_lifecycle_and_concurrency_without_commands(setup):
+    reader, transport, _, _ = setup
+    with pytest.raises(RuntimeError, match="Not connected"):
+        reader.read_settings()
+    assert not transport.sent and not transport.received
+    reader, transport = connect_settings(setup)
+
+    def check_locked(timeout):
+        if timeout:
+            for operation in (reader.read_settings, reader.read_position,
+                              reader.connect, reader.close):
+                with pytest.raises(RuntimeError, match="in progress"):
+                    operation()
+
+    transport.recv_hook = check_locked
+    assert reader.read_settings()["run_mode"] == 5
+    assert len(transport.sent) == 7
+    assert transport.shutdown_calls == 0
+
+
+def test_settings_ignores_wrong_host_motor_and_register(setup):
+    reader, transport = connect_settings(setup)
+    respond = transport.replies
+
+    def unrelated_then_matching(request):
+        parameter, = struct.unpack_from("<H", request.data)
+        return [reply(register=parameter, host=3),
+                reply(register=parameter, motor=2),
+                reply(register=0xFFFF)] + respond(request)
+
+    transport.replies = unrelated_then_matching
+    assert reader.read_settings() == {key: value for key, _, _, value in SETTINGS}

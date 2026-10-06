@@ -51,7 +51,7 @@ This Lab fork tracks official SDK updates. Original APIs, including
 Lab-specific communication features live in separate modules and are imported
 explicitly; the original package exports are unchanged.
 
-### Read-only mechanical position
+### Read-only mechanical position and settings
 
 ```python
 from robstride_dynamics.position import PositionReader
@@ -63,11 +63,14 @@ try:
     reader.connect()
     raw_position_rad = reader.read_position(timeout_s=0.1)
     print(raw_position_rad)
+    settings = reader.read_settings(timeout_s=0.1)
+    print(settings)
 finally:
     reader.close()
 ```
 
-The reader sends only Private type-17 reads of `MECHANICAL_POSITION` (`0x7019`).
+The reader sends only Private type-17 parameter reads. `read_position()` reads
+`MECHANICAL_POSITION` (`0x7019`) with its existing signature and behavior.
 It does not scan, enable, disable, zero, change modes, or send control targets.
 It does **not** establish that the motor is disabled or stop a running motor.
 Position is raw motor radians, not calibrated robot joint position.
@@ -82,10 +85,34 @@ Position is raw motor radians, not calibrated robot joint position.
   cannot be perfectly excluded. Stop other controllers/readers during testing.
 - No physical device/driver/firmware validation has been performed.
 
+`read_settings(*, timeout_s=0.1) -> dict[str, int | float]` reads the following
+registers in order, decoding values explicitly as little-endian:
+
+| Result key | Register | Wire value / units |
+| --- | --- | --- |
+| `run_mode` | MODE `0x7005` | unsigned byte; accepted raw values: 0, 1, 2, 3, 5 |
+| `velocity_limit_rad_s` | VELOCITY_LIMIT `0x7017` | float32, rad/s |
+| `current_limit_a` | CURRENT_LIMIT `0x7018` | float32, A |
+| `torque_limit_nm` | TORQUE_LIMIT `0x700b` | float32, N·m |
+| `can_timeout_raw` | CAN_TIMEOUT `0x7028` | unsigned uint32; raw, no assumed conversion to seconds |
+| `zero_state` | ZERO_STATE `0x7029` | unsigned byte; accepted raw values: 0, 1 |
+| `raw_motor_position_rad` | MECHANICAL_POSITION `0x7019` | float32, raw motor radians |
+
+Each register has its own deadline covering drain/send/receive, so the complete
+call has a budget of roughly `7 * timeout_s` (0.7 s by default), provided the
+transport honors timeouts. It stops at the first failure: no partial dictionary,
+fallback defaults, or inferred settings are returned. Floats must be finite and
+limits nonnegative; unsupported mode/zero-state replies raise `ValueError` with
+the raw value. Request and value-validation failures poison the same session for
+both read methods until explicit close/reconnect. Invalid arguments and rejected
+concurrent calls do not poison it. The entire call rejects concurrent reader
+operations, but these sequential reads are **not an atomic motor snapshot**.
+`zero_state` is returned without interpreting it as proof that motion is safe.
+
 Hardware-free tests (in a virtual environment with this checkout and pytest installed):
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests
+PYTHONPATH= PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ../wani_runtime/.venv/bin/python -m pytest tests
 ```
 
 Maintain and test these additive modules separately when incorporating official

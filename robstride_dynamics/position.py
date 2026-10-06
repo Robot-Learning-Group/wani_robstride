@@ -1,4 +1,4 @@
-"""Additive Lab API for bounded read-only position requests.
+"""Additive Lab API for bounded read-only position and settings requests.
 
 Original SDK APIs remain unchanged. Import this module explicitly to use the
 Lab-owned transaction and no-command cleanup implementation.
@@ -15,9 +15,9 @@ from .protocol import CommunicationType, ParameterType
 
 
 class PositionReader:
-    """Read raw mechanical position (radians), without changing motor state.
+    """Read raw mechanical position and settings without changing motor state.
 
-    Only type-17 reads of register 0x7019 are sent. No RobstrideBus instance,
+    Only type-17 parameter reads are sent. No RobstrideBus instance,
     scan, enable, disable, parameter write, or destructor command is used.
     Operations reject concurrency rather than waiting for another operation.
     A failed request poisons the session: explicitly close and reconnect before
@@ -110,75 +110,129 @@ class PositionReader:
         Transport errors propagate. Any request failure requires close/connect;
         invalid arguments and rejected concurrent calls do not poison a session.
         """
+        self._validate_timeout(timeout_s)
+        self._acquire()
+        try:
+            return self._read_parameter(
+                ParameterType.MECHANICAL_POSITION[0], "<f", timeout_s
+            )
+        finally:
+            self._lock.release()
+
+    @staticmethod
+    def _validate_timeout(timeout_s: float) -> None:
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
             raise TypeError("timeout_s must be a positive finite number")
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be a positive finite number")
+
+    def read_settings(self, *, timeout_s: float = 0.1) -> dict[str, int | float]:
+        """Read seven registers sequentially; return only a complete result.
+
+        Each register gets its own bounded timeout (about 7 * timeout_s total).
+        Values are raw motor settings, not defaults or a calibrated joint state.
+        CAN timeout is an unsigned raw integer, with no assumed seconds conversion.
+        The reads are not an atomic motor snapshot. Any request or validation
+        failure poisons the session and requires close/connect before retrying.
+        Invalid timeouts and rejected concurrent calls do not poison the session.
+        """
+        self._validate_timeout(timeout_s)
         self._acquire()
         try:
-            handler = self.channel_handler
-            if handler is None:
-                raise RuntimeError("Not connected; call connect first")
-            if self._failed:
-                raise RuntimeError("Failed session; close and reconnect before reading")
-            try:
-                deadline = time.monotonic() + timeout_s
-                for _ in range(self._MAX_DRAIN_FRAMES):
-                    self._remaining(deadline)
-                    queued = handler.recv(timeout=0.0)
-                    self._remaining(deadline)
-                    if queued is None:
-                        break
-                else:
-                    raise RuntimeError("Receive queue did not drain within 256 frames")
-
-                parameter = ParameterType.MECHANICAL_POSITION[0]
-                request = can.Message(
-                    arbitration_id=(CommunicationType.READ_PARAMETER << 24)
-                    | (self.host_id << 8) | self._motor_id,
-                    is_extended_id=True,
-                    data=struct.pack("<HHL", parameter, 0, 0),
-                    check=True,
-                )
-                handler.send(request, timeout=self._remaining(deadline))
-                self._remaining(deadline)
-                while True:
-                    frame = handler.recv(timeout=self._remaining(deadline))
-                    self._remaining(deadline)
-                    if frame is None:
-                        raise TimeoutError("No mechanical position reply")
-                    identifier = frame.arbitration_id
-                    source = (identifier >> 8) & 0xFF
-                    destination = identifier & 0xFF
-                    kind = (identifier >> 24) & 0x1F
-                    if source != self._motor_id or destination != self.host_id:
-                        continue
-                    if kind not in (CommunicationType.READ_PARAMETER,
-                                    CommunicationType.FAULT_REPORT):
-                        continue
-                    if (not frame.is_extended_id or frame.is_error_frame
-                            or frame.is_remote_frame or frame.is_fd
-                            or frame.bitrate_switch or frame.error_state_indicator
-                            or not 0 <= identifier <= 0x1FFFFFFF
-                            or frame.dlc != 8 or len(frame.data) != 8):
-                        raise ValueError("Malformed target classical CAN reply")
-                    if kind == CommunicationType.FAULT_REPORT:
-                        fault, warning = struct.unpack("<LL", frame.data)
-                        raise RuntimeError(
-                            f"Motor {self._motor_id} fault report: "
-                            f"fault=0x{fault:08x}, warning=0x{warning:08x}"
-                        )
-                    register, reserved = struct.unpack("<HH", frame.data[:4])
-                    if register != parameter:
-                        continue
-                    if (identifier >> 16) & 0xFF or reserved != 0:
-                        raise ValueError("Malformed target parameter reply header")
-                    value, = struct.unpack("<f", frame.data[4:])
-                    if not math.isfinite(value):
-                        raise ValueError("Nonfinite mechanical position reply")
-                    return value
-            except BaseException:
-                self._failed = True
-                raise
+            settings = {}
+            registers = (
+                ("run_mode", ParameterType.MODE[0], "<B"),
+                ("velocity_limit_rad_s", ParameterType.VELOCITY_LIMIT[0], "<f"),
+                ("current_limit_a", ParameterType.CURRENT_LIMIT[0], "<f"),
+                ("torque_limit_nm", ParameterType.TORQUE_LIMIT[0], "<f"),
+                ("can_timeout_raw", ParameterType.CAN_TIMEOUT[0], "<I"),
+                ("zero_state", ParameterType.ZERO_STATE[0], "<B"),
+                ("raw_motor_position_rad", ParameterType.MECHANICAL_POSITION[0], "<f"),
+            )
+            for key, parameter, format in registers:
+                value = self._read_parameter(parameter, format, timeout_s)
+                try:
+                    if key == "run_mode" and value not in (0, 1, 2, 3, 5):
+                        raise ValueError(f"Unsupported run_mode raw value: {value}")
+                    if key == "zero_state" and value not in (0, 1):
+                        raise ValueError(f"Unsupported zero_state raw value: {value}")
+                    if key in ("velocity_limit_rad_s", "current_limit_a",
+                               "torque_limit_nm") and value < 0:
+                        raise ValueError(f"Negative {key} reply: {value}")
+                except BaseException:
+                    self._failed = True
+                    raise
+                settings[key] = value
+            return settings
         finally:
             self._lock.release()
+
+    def _read_parameter(
+        self, parameter: int, format: str, timeout_s: float
+    ) -> int | float:
+        """Run one correlated transaction while the caller holds the reader lock."""
+        handler = self.channel_handler
+        if handler is None:
+            raise RuntimeError("Not connected; call connect first")
+        if self._failed:
+            raise RuntimeError("Failed session; close and reconnect before reading")
+        try:
+            deadline = time.monotonic() + timeout_s
+            for _ in range(self._MAX_DRAIN_FRAMES):
+                self._remaining(deadline)
+                queued = handler.recv(timeout=0.0)
+                self._remaining(deadline)
+                if queued is None:
+                    break
+            else:
+                raise RuntimeError("Receive queue did not drain within 256 frames")
+
+            request = can.Message(
+                arbitration_id=(CommunicationType.READ_PARAMETER << 24)
+                | (self.host_id << 8) | self._motor_id,
+                is_extended_id=True,
+                data=struct.pack("<HHL", parameter, 0, 0),
+                check=True,
+            )
+            handler.send(request, timeout=self._remaining(deadline))
+            self._remaining(deadline)
+            while True:
+                frame = handler.recv(timeout=self._remaining(deadline))
+                self._remaining(deadline)
+                if frame is None:
+                    raise TimeoutError("No mechanical position reply")
+                identifier = frame.arbitration_id
+                source = (identifier >> 8) & 0xFF
+                destination = identifier & 0xFF
+                kind = (identifier >> 24) & 0x1F
+                if source != self._motor_id or destination != self.host_id:
+                    continue
+                if kind not in (CommunicationType.READ_PARAMETER,
+                                CommunicationType.FAULT_REPORT):
+                    continue
+                if (not frame.is_extended_id or frame.is_error_frame
+                        or frame.is_remote_frame or frame.is_fd
+                        or frame.bitrate_switch or frame.error_state_indicator
+                        or not 0 <= identifier <= 0x1FFFFFFF
+                        or frame.dlc != 8 or len(frame.data) != 8):
+                    raise ValueError("Malformed target classical CAN reply")
+                if kind == CommunicationType.FAULT_REPORT:
+                    fault, warning = struct.unpack("<LL", frame.data)
+                    raise RuntimeError(
+                        f"Motor {self._motor_id} fault report: "
+                        f"fault=0x{fault:08x}, warning=0x{warning:08x}"
+                    )
+                register, reserved = struct.unpack("<HH", frame.data[:4])
+                if register != parameter:
+                    continue
+                if (identifier >> 16) & 0xFF or reserved != 0:
+                    raise ValueError("Malformed target parameter reply header")
+                value, = struct.unpack_from(format, frame.data, 4)
+                if format == "<f" and not math.isfinite(value):
+                    if parameter == ParameterType.MECHANICAL_POSITION[0]:
+                        raise ValueError("Nonfinite mechanical position reply")
+                    raise ValueError(f"Nonfinite parameter 0x{parameter:04x} reply")
+                return value
+        except BaseException:
+            self._failed = True
+            raise
