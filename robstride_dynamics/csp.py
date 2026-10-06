@@ -131,11 +131,17 @@ class CspMotor(PositionReader):
         if handler is None:
             raise RuntimeError("Not connected; call connect first")
         deadline = time.monotonic() + timeout_s
+        context = ("CSP disable Reset status confirmation" if kind == C.DISABLE
+                   else f"CSP command Type-{kind} status (mode {expected_mode})")
+
+        def remaining():
+            return self._remaining(deadline, context)
+
         if drain:
             for _ in range(self._MAX_DRAIN_FRAMES):
-                self._remaining(deadline)
+                remaining()
                 queued = handler.recv(timeout=0.0)
-                self._remaining(deadline)
+                remaining()
                 if queued is None:
                     break
                 self._check_fault_frame(queued)
@@ -144,13 +150,13 @@ class CspMotor(PositionReader):
         handler.send(can.Message(
             arbitration_id=(kind << 24) | (self.host_id << 8) | self._motor_id,
             is_extended_id=True, data=data, check=True,
-        ), timeout=self._remaining(deadline))
-        self._remaining(deadline)
+        ), timeout=remaining())
+        remaining()
         for _ in range(self._MAX_DRAIN_FRAMES):
-            frame = handler.recv(timeout=self._remaining(deadline))
-            self._remaining(deadline)
+            frame = handler.recv(timeout=remaining())
+            remaining()
             if frame is None:
-                raise TimeoutError("No CSP status reply")
+                raise TimeoutError(f"{context} timed out: no reply")
             self._check_fault_frame(frame)
             identifier = frame.arbitration_id
             if ((identifier >> 8) & 255) != self._motor_id or (identifier & 255) != self.host_id:
@@ -158,7 +164,12 @@ class CspMotor(PositionReader):
             reply_kind = (identifier >> 24) & 31
             if reply_kind != C.OPERATION_STATUS:
                 continue
-            if ((identifier >> 22) & 3) != expected_mode:
+            mode = (identifier >> 22) & 3
+            # Disable has no pre-drain: an in-flight Motor status is not a stop
+            # acknowledgment. Keep waiting for Reset within the original budget.
+            if kind == C.DISABLE and mode == 2:
+                continue
+            if mode != expected_mode:
                 raise RuntimeError(f"Unexpected Type-2 mode; require {expected_mode}")
             return
         raise RuntimeError("Status receive frame budget exhausted")
@@ -272,7 +283,8 @@ class CspMotor(PositionReader):
     def disable(self, *, timeout_s: float = 0.1) -> None:
         """Always attempt Type-4 (no fault clear), without pre-drain or poison gate.
 
-        Reset status verification is bounded best effort; errors propagate. This
+        Only fault-free Reset confirms; in-flight Motor status is skipped within
+        the same send/receive deadline and frame budget. Errors propagate. This
         cannot guarantee stopping a disconnected/faulted motor. A poisoned session
         remains poisoned after a successful disable.
         """

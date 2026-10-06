@@ -90,10 +90,10 @@ class PositionReader:
             self._lock.release()
 
     @staticmethod
-    def _remaining(deadline: float) -> float:
+    def _remaining(deadline: float, context: str) -> float:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("Mechanical position request timed out")
+            raise TimeoutError(f"{context} timed out")
         return remaining
 
     def read_position(self, *, timeout_s: float = 0.1) -> float:
@@ -208,10 +208,15 @@ class PositionReader:
             raise RuntimeError("Failed session; close and reconnect before reading")
         try:
             deadline = time.monotonic() + timeout_s
+            context = f"Register read 0x{parameter:04x}"
+
+            def remaining():
+                return self._remaining(deadline, context)
+
             for _ in range(self._MAX_DRAIN_FRAMES):
-                self._remaining(deadline)
+                remaining()
                 queued = handler.recv(timeout=0.0)
-                self._remaining(deadline)
+                remaining()
                 if queued is None:
                     break
                 self._check_fault_frame(queued)
@@ -225,13 +230,13 @@ class PositionReader:
                 data=struct.pack("<HHL", parameter, 0, 0),
                 check=True,
             )
-            handler.send(request, timeout=self._remaining(deadline))
-            self._remaining(deadline)
+            handler.send(request, timeout=remaining())
+            remaining()
             while True:
-                frame = handler.recv(timeout=self._remaining(deadline))
-                self._remaining(deadline)
+                frame = handler.recv(timeout=remaining())
+                remaining()
                 if frame is None:
-                    raise TimeoutError("No mechanical position reply")
+                    raise TimeoutError(f"{context} timed out: no reply")
                 self._check_fault_frame(frame)
                 identifier = frame.arbitration_id
                 source = (identifier >> 8) & 0xFF

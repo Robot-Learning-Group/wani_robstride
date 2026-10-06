@@ -106,13 +106,32 @@ finally:
         motor.close()
 ```
 
-Disable bypasses session poison and sends immediately without pre-draining a
-busy receive queue. It then makes a bounded best-effort verification of a
-fault-free Reset status; timeout, malformed response, fault, unexpected mode or
-transport errors propagate. A queued target fault is checked only after the
-disable has been sent, and causes stop verification to fail. It never clears faults and successful disable does
-not unpoison the session. Cleanup is scoped only to this motor/transport. The SDK
-does not modify runtime code or automatically issue cleanup commands.
+Disable bypasses session poison and sends Type-4 immediately without pre-draining
+or clearing faults. Only a valid, fault-free Type-2 **Reset (0)** status addressed
+from the configured motor to the configured host confirms it. Valid, fault-free
+**Motor (2)** statuses may already be in flight; disable skips them and continues
+waiting for Reset. Motor status alone is never a successful acknowledgment.
+Other target modes, target faults (including any Type-21 report), malformed target
+status/fault frames and transport errors fail confirmation. Wrong motor/host IDs
+and unrelated message types cannot confirm disable. A queued target fault is
+checked only after sending disable and still fails confirmation, even if a Reset
+is queued behind it. Writes and enable retain their strict expected-mode checks.
+
+The caller-selected `disable(timeout_s=...)` (default **0.1 s**) is a single
+monotonic budget covering **send plus all receives**, not a fresh timeout for
+each Motor status or a fixed 20 ms wait. At most 256 received frames are examined;
+a flood may exhaust that cap before the deadline. Missing Reset raises
+`TimeoutError`; frame-budget exhaustion raises `RuntimeError`. Backends must
+honor timeouts for the wall-clock bound to hold. Deadline and no-reply errors
+identify disable Reset confirmation, other CSP command status, or the specific
+register read (e.g. `Register read 0x7019`), rather than labeling all timeouts as
+mechanical-position requests.
+
+Owners should supply an independent cleanup budget, not reuse a short streaming
+transaction timeout. Disable does not gate on `CAN_TIMEOUT`, wait for watchdog
+expiry, or assume watchdog success. Successful disable revokes preparation but
+does not unpoison a failed session. Cleanup is scoped only to this motor/transport;
+the SDK does not modify runtime code or automatically issue cleanup commands.
 
 ## Limits of verification
 
