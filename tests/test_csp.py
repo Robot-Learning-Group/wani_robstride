@@ -336,7 +336,7 @@ def test_cleanup_one_joint_failure_does_not_touch_another(rig):
     bus.hook = lambda request, frames: [status(2)]
     bus.shutdown_error = OSError('shutdown failure')
     try:
-        with pytest.raises(RuntimeError, match='mode'):
+        with pytest.raises(TimeoutError, match='CSP disable Reset status confirmation'):
             motor.disable()
     finally:
         with pytest.raises(OSError, match='shutdown failure'):
