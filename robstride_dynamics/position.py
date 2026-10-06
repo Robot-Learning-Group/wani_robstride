@@ -103,7 +103,9 @@ class PositionReader:
         monotonic deadline. Transport calls must honor their timeout arguments;
         Python cannot hard-bound a misbehaving backend. At most 256 preexisting
         frames are drained nonblocking; a nonempty queue at that limit fails
-        without sending. Unrelated traffic is ignored only until the deadline.
+        without sending. Target Type-21 reports, Type-2 fault flags and malformed
+        target status/fault frames fail even during drain. Unrelated traffic is
+        ignored only until the deadline.
 
         TimeoutError indicates deadline expiry; ValueError indicates a malformed
         target reply; RuntimeError indicates a target fault or lifecycle error.
@@ -167,6 +169,34 @@ class PositionReader:
         finally:
             self._lock.release()
 
+    def _check_fault_frame(self, frame: can.Message) -> None:
+        """Reject addressed faults even in queued traffic unrelated to a read.
+
+        Caller holds the transport lock and owns deadline/poison handling.
+        A Type-21 report is always a failure, including zero-valued reports;
+        valid fault-free Type-2 status is not a parameter reply.
+        """
+        identifier = frame.arbitration_id
+        if ((identifier >> 8) & 0xFF) != self._motor_id or (identifier & 0xFF) != self.host_id:
+            return
+        kind = (identifier >> 24) & 0x1F
+        if kind not in (CommunicationType.OPERATION_STATUS, CommunicationType.FAULT_REPORT):
+            return
+        if (not frame.is_extended_id or frame.is_error_frame
+                or frame.is_remote_frame or frame.is_fd
+                or frame.bitrate_switch or frame.error_state_indicator
+                or not 0 <= identifier <= 0x1FFFFFFF
+                or frame.dlc != 8 or len(frame.data) != 8):
+            raise ValueError("Malformed target classical CAN reply")
+        if kind == CommunicationType.FAULT_REPORT:
+            fault, warning = struct.unpack("<LL", frame.data)
+            raise RuntimeError(
+                f"Motor {self._motor_id} fault report: "
+                f"fault=0x{fault:08x}, warning=0x{warning:08x}"
+            )
+        if (identifier >> 16) & 0x3F:
+            raise RuntimeError(f"Motor {self._motor_id} Type-2 fault flags set")
+
     def _read_parameter(
         self, parameter: int, format: str, timeout_s: float
     ) -> int | float:
@@ -184,6 +214,7 @@ class PositionReader:
                 self._remaining(deadline)
                 if queued is None:
                     break
+                self._check_fault_frame(queued)
             else:
                 raise RuntimeError("Receive queue did not drain within 256 frames")
 
@@ -201,14 +232,14 @@ class PositionReader:
                 self._remaining(deadline)
                 if frame is None:
                     raise TimeoutError("No mechanical position reply")
+                self._check_fault_frame(frame)
                 identifier = frame.arbitration_id
                 source = (identifier >> 8) & 0xFF
                 destination = identifier & 0xFF
                 kind = (identifier >> 24) & 0x1F
                 if source != self._motor_id or destination != self.host_id:
                     continue
-                if kind not in (CommunicationType.READ_PARAMETER,
-                                CommunicationType.FAULT_REPORT):
+                if kind != CommunicationType.READ_PARAMETER:
                     continue
                 if (not frame.is_extended_id or frame.is_error_frame
                         or frame.is_remote_frame or frame.is_fd
@@ -216,12 +247,7 @@ class PositionReader:
                         or not 0 <= identifier <= 0x1FFFFFFF
                         or frame.dlc != 8 or len(frame.data) != 8):
                     raise ValueError("Malformed target classical CAN reply")
-                if kind == CommunicationType.FAULT_REPORT:
-                    fault, warning = struct.unpack("<LL", frame.data)
-                    raise RuntimeError(
-                        f"Motor {self._motor_id} fault report: "
-                        f"fault=0x{fault:08x}, warning=0x{warning:08x}"
-                    )
+
                 register, reserved = struct.unpack("<HH", frame.data[:4])
                 if register != parameter:
                     continue

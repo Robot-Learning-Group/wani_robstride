@@ -219,7 +219,7 @@ def test_malformed_matching_fault_fails(setup):
 
 def test_queued_stale_reply_is_drained_before_send(setup):
     reader, transport = connect_with(setup, [reply(4.0)])
-    transport.queued.extend([reply(99.0), reply(motor=2), reply(kind=21)])
+    transport.queued.extend([reply(99.0), reply(motor=2), reply(kind=21, motor=2)])
     assert reader.read_position() == 4.0
     assert transport.received[:4] == [0.0] * 4
     assert transport.sent[0][1] == pytest.approx(0.097)

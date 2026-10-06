@@ -51,6 +51,16 @@ This Lab fork tracks official SDK updates. Original APIs, including
 Lab-specific communication features live in separate modules and are imported
 explicitly; the original package exports are unchanged.
 
+### Explicit single-motor CSP control
+
+`robstride_dynamics.csp.CspMotor` is an additive, powered-control API with
+explicit limits, disabled target preparation/readback, bounded status checks,
+and mandatory owner disable/close cleanup. It does not change the original API
+or automatically make CSP the default. See [CSP.md](CSP.md) before use.
+
+**Not physically validated.** Unlike `PositionReader`, preparation writes
+settings and enables a motor. Simulation success is not hardware safety proof.
+
 ### Read-only mechanical position and settings
 
 ```python
