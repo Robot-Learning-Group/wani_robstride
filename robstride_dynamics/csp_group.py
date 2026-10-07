@@ -19,6 +19,7 @@ import can
 from .csp import CspMotor, _SETTINGS
 from .position import PositionReader
 from .protocol import CommunicationType as C, ParameterType as P
+from .table import MODEL_MIT_POSITION_TABLE
 
 __all__ = ["CspGroup"]
 
@@ -38,7 +39,8 @@ class CspGroup:
                "expected_position_rad"}
 
     def __init__(self, channel: str, motor_ids: dict[str, int],
-                 bitrate: int = 1000000, host_id: int = 255) -> None:
+                 bitrate: int = 1000000, host_id: int = 255,
+                 motor_models: dict[str, str] | None = None) -> None:
         if not isinstance(motor_ids, dict) or not motor_ids:
             raise ValueError("motor_ids must be a nonempty name-to-ID dict")
         for name, motor_id in motor_ids.items():
@@ -48,8 +50,15 @@ class CspGroup:
             PositionReader(channel, motor_id, bitrate, host_id)
         if len(set(motor_ids.values())) != len(motor_ids):
             raise ValueError("Motor IDs must be unique")
+        if motor_models is not None:
+            if not isinstance(motor_models, dict) or motor_models.keys() != motor_ids.keys():
+                raise ValueError("motor_models must contain exactly the selected motor names")
+            for name, model in motor_models.items():
+                if not isinstance(model, str) or model not in MODEL_MIT_POSITION_TABLE:
+                    raise ValueError(f"Unsupported motor model for {name}: {model!r}")
         self.channel, self.bitrate, self.host_id = channel, bitrate, host_id
         self._motor_ids = dict(motor_ids)
+        self._motor_models = None if motor_models is None else dict(motor_models)
         self._names_by_id = {value: name for name, value in motor_ids.items()}
         self.channel_handler = None
         self._lock = threading.Lock()
@@ -200,7 +209,8 @@ class CspGroup:
         raise RuntimeError("Receive queue drain frame budget exhausted")
 
     def _collect(self, deadline, *, mode=None, register=None, fmt=None, disable=False,
-                 status_temperature_c=None, status_receive_monotonic_s=None):
+                 status_temperature_c=None, status_receive_monotonic_s=None,
+                 status_position_rad=None):
         results = {}
         for _ in range(self._FRAME_BUDGET):
             frame = self._recv(deadline)
@@ -231,7 +241,7 @@ class CspGroup:
                 value = None
             if name in self._pending:
                 if register is None:
-                    _, _, _, temperature_u16 = struct.unpack(">HHHH", frame.data)
+                    position_u16, _, _, temperature_u16 = struct.unpack(">HHHH", frame.data)
                     temperature_c = temperature_u16 * 0.1
                     if not math.isfinite(temperature_c):
                         raise ValueError(f"Nonfinite status temperature from {name}")
@@ -242,6 +252,10 @@ class CspGroup:
                         status_temperature_c[name] = temperature_c
                     if status_receive_monotonic_s is not None:
                         status_receive_monotonic_s[name] = received_s
+                    if status_position_rad is not None:
+                        model = self._motor_models[name]
+                        status_position_rad[name] = ((position_u16 / 0x7FFF - 1) *
+                                                     MODEL_MIT_POSITION_TABLE[model])
                 results[name] = value
                 self._pending.remove(name)
             if not self._pending:
@@ -260,14 +274,18 @@ class CspGroup:
             self._send(name, C.READ_PARAMETER, struct.pack("<HHL", register, 0, 0), deadline)
         return self._collect(deadline, register=register, fmt=fmt)
 
-    def _command_batch(self, kind, payloads, mode, timeout_s, phase, *, drain=True):
+    def _command_batch(self, kind, payloads, mode, timeout_s, phase, *, drain=True,
+                       capture_status_positions=False):
         self._start_phase(phase)
         deadline = time.monotonic() + timeout_s
         if drain:
             self._drain(deadline)
         for name in self._motor_ids:
             self._send(name, kind, payloads[name], deadline)
-        return self._collect(deadline, mode=mode, disable=kind == C.DISABLE)
+        positions = {} if capture_status_positions else None
+        self._collect(deadline, mode=mode, disable=kind == C.DISABLE,
+                      status_position_rad=positions)
+        return positions
 
     def _write_batch(self, register, values, fmt, timeout_s, phase):
         payloads = {n: struct.pack("<HH", register, 0) +
@@ -322,6 +340,8 @@ class CspGroup:
         """
         PositionReader._validate_timeout(timeout_s)
         self._exact_keys(limits, "limits")
+        if self._motor_models is None:
+            raise ValueError("motor_models are required for preparation and control")
         if check_cancel is not None and not callable(check_cancel):
             raise TypeError("check_cancel must be callable or None")
         config = {}
@@ -387,14 +407,17 @@ class CspGroup:
                         abs(values["raw_motor_position_rad"] - initial[name]) > tolerance or
                         abs(targets[name] - values["raw_motor_position_rad"]) > tolerance):
                     raise ValueError(f"Disabled hold position readback mismatch for {name}")
-            self._command_batch(C.ENABLE, {n: bytes(8) for n in self._motor_ids},
-                                2, timeout_s, "prepare:enable")
+            enable_positions = self._command_batch(
+                C.ENABLE, {n: bytes(8) for n in self._motor_ids}, 2, timeout_s,
+                "prepare:enable", capture_status_positions=True)
             positions = self._read_batch(P.MECHANICAL_POSITION[0], "<f", timeout_s,
                                          "prepare:post_enable_positions")
             self._start_phase("prepare:post_enable_guards")
             for name, position in positions.items():
                 tolerance = config[name]["position_tolerance_rad"]
                 CspMotor._branch(position)
+                if abs(enable_positions[name] - position) > tolerance:
+                    raise ValueError(f"Enable status/register position mismatch for {name}")
                 CspMotor._check_position_guard(position, guards[name], tolerance)
                 if abs(position - initial[name]) > tolerance:
                     raise ValueError(f"Post-enable movement exceeds tolerance for {name}")
@@ -413,6 +436,8 @@ class CspGroup:
         """
         PositionReader._validate_timeout(timeout_s)
         self._exact_keys(targets, "targets")
+        if self._motor_models is None:
+            raise ValueError("motor_models are required for preparation and control")
         wire = {}
         for name, value in targets.items():
             number = CspMotor._number(value, name)
@@ -429,7 +454,8 @@ class CspGroup:
             deadline = start + timeout_s
             self.last_cycle = {"target_send_monotonic_s": {}, "target_burst_s": 0., "total_s": 0.,
                                "status_temperature_c": {},
-                               "status_receive_monotonic_s": {}}
+                               "status_receive_monotonic_s": {},
+                               "status_position_rad": {}}
             try:
                 self._start_phase("control:drain")
                 self._drain(deadline)
@@ -450,13 +476,10 @@ class CspGroup:
                     deadline, mode=2,
                     status_temperature_c=self.last_cycle["status_temperature_c"],
                     status_receive_monotonic_s=self.last_cycle["status_receive_monotonic_s"],
+                    status_position_rad=self.last_cycle["status_position_rad"],
                 )
-                positions = self._read_batch(P.MECHANICAL_POSITION[0], "<f", timeout_s,
-                                             "control:positions", deadline=deadline)
-                for position in positions.values():
-                    CspMotor._branch(position)
                 self.last_error = None
-                return positions
+                return dict(self.last_cycle["status_position_rad"])
             finally:
                 self.last_cycle["total_s"] = time.monotonic() - start
 

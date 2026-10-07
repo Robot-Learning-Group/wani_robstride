@@ -160,7 +160,8 @@ for the selected motor IDs and host destination:
 from robstride_dynamics.csp_group import CspGroup
 
 # API signatures (not an executable control sequence):
-CspGroup(channel, motor_ids: dict[str, int], bitrate=1000000, host_id=255)
+CspGroup(channel, motor_ids: dict[str, int], bitrate=1000000, host_id=255,
+         motor_models: dict[str, str] | None = None)
 group.connect()  # No commands.
 group.read_settings(*, timeout_s) -> dict[str, dict]
 group.prepare(limits: dict[str, dict], *, timeout_s=.02, check_cancel=None) -> dict[str, float]
@@ -171,7 +172,12 @@ group.last_status_monotonic_s    # dict[name, float]
 group.close()  # No commands, including after an error.
 ```
 
-Both input dictionaries must contain **exactly** the configured motor names.
+`motor_models`, when supplied, must contain **exactly** the configured motor names,
+and every value must be a model in `MODEL_MIT_POSITION_TABLE`. It is optional at
+construction for backward-compatible read-only `read_settings()` use, but
+`prepare()` and `send_positions()` reject a missing mapping before sending any
+frames. Both per-call input dictionaries must contain **exactly** the configured
+motor names.
 Each preparation entry must contain these seven fields: `velocity_limit_rad_s`,
 `current_limit_a`, `torque_limit_nm`, `position_tolerance_rad`,
 `position_min_rad`, `position_max_rad`, and `expected_position_rad`. These are
@@ -190,7 +196,10 @@ all; write each of the three limit registers to all; write current raw hold
 targets to all; batch-read settings and hold targets; verify all readbacks and
 position guards; batch-enable all and confirm Motor status; batch-read and
 verify raw positions against the initial and runtime expected references and
-the verified hold-target readback.
+the verified hold-target readback. The accepted enable Type-2 status position
+for each motor is decoded using its configured model and must also agree with
+the explicit post-enable `0x7019` position within that motor's supplied
+`position_tolerance_rad`.
 No motor is enabled while another is still being configured. Reported settings
 must have zero state 1, positive limits/watchdog, and a finite raw position on
 the verified branch. Limit increases are refused for both requested and encoded
@@ -214,9 +223,9 @@ The watchdog mapping is nominal, not empirical firmware verification.
 
 A control cycle instead uses **one deadline for the entire call**: drain queued
 traffic; write all targets **without receiving between sends**; collect a
-fault-free Type-2 Motor status from every motor; drain buffered traffic again
-under that same deadline; request all raw positions **without receiving between
-sends**; collect finite register-correlated `0x7019` replies. Each batch also
+fault-free Type-2 Motor status from every motor; and decode each accepted
+status payload's position. Control sends no explicit mechanical-position
+register request and waits for no Type-17 position reply. The status collection
 performs a bounded, nonblocking queue inspection after its final required reply,
 using the original deadline. This catches selected faults/malformed frames queued
 behind an otherwise complete response; an undrainable tail fails closed. Out-of-order replies are accepted; duplicates cannot confirm
@@ -237,7 +246,10 @@ Close/connect and prepare again before resuming control.
 Accepted command statuses also update `last_status_temperature_c` and
 `last_status_monotonic_s`. Temperature is decoded from the Type-2 `>HHHH`
 payload's final unsigned 16-bit field using the original bus API's exact
-`temperature_u16 * 0.1` °C scale. Only a selected, well-formed, fault-free
+`temperature_u16 * 0.1` °C scale. When positions are requested by preparation
+or control, the first field is decoded with the original bus formula
+`(position_u16 / 0x7FFF - 1) * MODEL_MIT_POSITION_TABLE[model]`. Only a selected,
+well-formed, fault-free
 Type-2 status accepted as a still-pending required response to a normal write,
 enable, or control-target batch updates these dictionaries. Queue drains,
 unrelated or duplicate frames, fault frames, malformed frames, and explicit
@@ -255,6 +267,8 @@ on every successful `connect()`.
 - `status_temperature_c`: a per-cycle name-to-temperature copy populated only by
   the control target statuses accepted in that cycle.
 - `status_receive_monotonic_s`: matching host monotonic acceptance timestamps.
+- `status_position_rad`: positions decoded directly from the accepted control
+  Type-2 statuses; this is also the successful `send_positions()` return value.
 - `total_s`: entire control batch duration, also updated on failure.
 
 `last_error` identifies a failing `phase` and ordered `pending_motors` list;

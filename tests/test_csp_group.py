@@ -8,12 +8,20 @@ import pytest
 
 from robstride_dynamics import csp_group
 from robstride_dynamics.csp_group import CspGroup
+from robstride_dynamics.table import MODEL_MIT_POSITION_TABLE
 
 
 LIMIT = dict(velocity_limit_rad_s=1., current_limit_a=2., torque_limit_nm=3.,
              position_tolerance_rad=.01, position_min_rad=-1.,
              position_max_rad=1., expected_position_rad=.25)
 REGISTERS = [0x7005, 0x7017, 0x7018, 0x700B, 0x7028, 0x7029, 0x7019]
+MODEL = "rs-02"
+
+
+def encode_status_position(position, model=MODEL):
+    if not math.isfinite(position):
+        return 0
+    return round((position / MODEL_MIT_POSITION_TABLE[model] + 1) * 0x7FFF)
 
 
 def status(motor, mode=0, faults=0, kind=2, temperature_u16=0,
@@ -79,7 +87,9 @@ class GroupBus:
                 self.modes[motor] = 2
             elif kind == 4:
                 self.modes[motor] = 0
-            frames = [status(motor, self.modes[motor])]
+            frames = [status(motor, self.modes[motor],
+                             position_u16=encode_status_position(
+                                 self.values[motor][0x7019]))]
         if self.hook:
             frames = self.hook(frame, frames)
         for response in frames:
@@ -122,7 +132,8 @@ def rig(monkeypatch):
         return bus
 
     monkeypatch.setattr(can.interface, "Bus", open_bus)
-    group = CspGroup("fake", {"a": 1, "b": 2})
+    group = CspGroup("fake", {"a": 1, "b": 2},
+                     motor_models={"a": MODEL, "b": MODEL})
     group.connect()
     yield group, bus, clock
     group.close()
@@ -190,6 +201,35 @@ def test_invalid_ids(ids):
         CspGroup("fake", ids)
 
 
+@pytest.mark.parametrize("models", [{"a": MODEL}, {"a": MODEL, "b": "unknown"},
+                                    {"a": MODEL, "b": None}, []])
+def test_invalid_motor_models_rejected(models):
+    with pytest.raises((ValueError, TypeError)):
+        CspGroup("fake", {"a": 1, "b": 2}, motor_models=models)
+
+
+def test_missing_models_allow_read_only_but_reject_prepare_before_sends(monkeypatch):
+    clock = Clock()
+    bus = GroupBus(clock)
+    monkeypatch.setattr(csp_group.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus)
+    group = CspGroup("fake", {"a": 1, "b": 2})
+    group.connect()
+    try:
+        assert set(group.read_settings(timeout_s=.02)) == {"a", "b"}
+        bus.sent.clear()
+        with pytest.raises(ValueError, match="motor_models"):
+            group.prepare(limits(group))
+        assert not bus.sent
+        group._prepared = True
+        group._watchdogs = {"a": 20000, "b": 20000}
+        with pytest.raises(ValueError, match="motor_models"):
+            group.send_positions({"a": .5, "b": .5}, timeout_s=.02)
+        assert not bus.sent
+    finally:
+        group.close()
+
+
 def test_settings_register_batches_out_of_order(rig):
     group, bus, _ = rig
     bus.reverse = True
@@ -209,7 +249,9 @@ def test_prepare_phases_delayed_enable_and_control(monkeypatch, count):
     bus.reverse = True
     monkeypatch.setattr(csp_group.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(can.interface, "Bus", lambda **kwargs: bus)
-    group = CspGroup("fake", {f"m{i}": i for i in range(1, count + 1)})
+    motor_ids = {f"m{i}": i for i in range(1, count + 1)}
+    group = CspGroup("fake", motor_ids,
+                     motor_models={name: MODEL for name in motor_ids})
     group.connect()
     try:
         assert group.prepare(limits(group)) == {n: .25 for n in group._motor_ids}
@@ -225,8 +267,11 @@ def test_prepare_phases_delayed_enable_and_control(monkeypatch, count):
         for motor in bus.values:
             bus.values[motor][0x7019] = -.375
         result = group.send_positions({n: .5 for n in group._motor_ids}, timeout_s=.02)
-        assert result == {n: -.375 for n in group._motor_ids}
-        assert [b[0][1] for b in assert_batches(bus.events, count)] == [18, 17]
+        quantization = MODEL_MIT_POSITION_TABLE[MODEL] / 0x7FFF
+        assert all(value == pytest.approx(-.375, abs=quantization / 2)
+                   for value in result.values())
+        assert [b[0][1] for b in assert_batches(bus.events, count)] == [18]
+        assert 17 not in kinds(bus)
         cycle = group.last_cycle
         assert set(cycle["target_send_monotonic_s"]) == set(group._motor_ids)
         stamps = list(cycle["target_send_monotonic_s"].values())
@@ -237,6 +282,7 @@ def test_prepare_phases_delayed_enable_and_control(monkeypatch, count):
         assert cycle["target_burst_s"] - (stamps[-1] - stamps[0]) == pytest.approx(bus.send_cost)
         assert cycle["target_burst_s"] == pytest.approx(count * bus.send_cost)
         assert cycle["total_s"] >= cycle["target_burst_s"]
+        assert cycle["status_position_rad"] == result
         bus.events.clear()
         assert group.disable(timeout_s=.02) == {n: None for n in group._motor_ids}
         assert_disable_order(bus.events, count)
@@ -333,12 +379,11 @@ def test_all_readbacks_gate_all_enables(rig, register, value):
     assert 3 not in kinds(bus) and group._failed
 
 
-@pytest.mark.parametrize("phase", ["status", "position"])
-def test_duplicates_do_not_satisfy_other_motor(rig, phase):
+def test_duplicates_do_not_satisfy_other_motor(rig):
     group, bus, _ = prepared(rig)
     def hook(request, frames):
         kind = request.arbitration_id >> 24
-        if (phase == "status" and kind == 18) or (phase == "position" and kind == 17):
+        if kind == 18:
             if request.arbitration_id & 255 == 2:
                 return []
             return frames * 4
@@ -346,8 +391,7 @@ def test_duplicates_do_not_satisfy_other_motor(rig, phase):
     bus.hook = hook
     with pytest.raises(TimeoutError):
         group.send_positions({"a": .5, "b": .5}, timeout_s=.02)
-    assert group.last_error == dict(phase="control:target_status" if phase == "status" else "control:positions",
-                                   pending_motors=["b"])
+    assert group.last_error == dict(phase="control:target_status", pending_motors=["b"])
     assert group._failed and not group._prepared
     count = len(bus.sent)
     with pytest.raises(RuntimeError, match="Failed session"):
@@ -355,7 +399,7 @@ def test_duplicates_do_not_satisfy_other_motor(rig, phase):
     assert len(bus.sent) == count
 
 
-@pytest.mark.parametrize("phase", ["drain", "status", "position"])
+@pytest.mark.parametrize("phase", ["drain", "status"])
 @pytest.mark.parametrize("bit", range(6))
 def test_fault_any_selected_motor_in_any_phase(rig, phase, bit):
     group, bus, clock = prepared(rig)
@@ -365,7 +409,7 @@ def test_fault_any_selected_motor_in_any_phase(rig, phase, bit):
     else:
         def hook(request, frames):
             kind = request.arbitration_id >> 24
-            if request.arbitration_id & 255 == 1 and kind == (18 if phase == "status" else 17):
+            if request.arbitration_id & 255 == 1 and kind == 18:
                 return [fault] + frames
             return frames
         bus.hook = hook
@@ -391,21 +435,22 @@ def test_malformed_selected_frames_poison(rig, kind, change):
     assert not bus.sent and group._failed
 
 
-@pytest.mark.parametrize("bad", [reply(2, 0x7019, .25, reserved=1),
-    reply(2, 0x7019, float("nan")), reply(2, 0x7019, float("inf")),
-    reply(2, 0x7019, 4.), status(2, kind=21)])
-def test_invalid_raw_reply_or_fault_report(rig, bad):
+@pytest.mark.parametrize("bad", [status(2, 2, faults=1), status(2, kind=21)])
+def test_invalid_status_or_fault_report(rig, bad):
     group, bus, _ = prepared(rig)
-    bus.hook = lambda request, frames: [bad] if request.arbitration_id >> 24 == 17 and request.arbitration_id & 255 == 2 else frames
+    bus.hook = lambda request, frames: ([bad] if request.arbitration_id >> 24 == 18
+                                        and request.arbitration_id & 255 == 2 else frames)
     with pytest.raises((ValueError, RuntimeError)):
         group.send_positions({"a": .5, "b": .5}, timeout_s=.02)
     assert group._failed
 
 
-def test_register_and_address_correlation(rig):
+def test_unrelated_register_and_address_traffic_is_ignored(rig):
     group, bus, _ = prepared(rig)
     bus.hook = lambda request, frames: [reply(2, 0x7016, .5), reply(3, 0x7019, .5)] + frames
-    assert group.send_positions({"a": .5, "b": .5}, timeout_s=.02) == {"a": .25, "b": .25}
+    result = group.send_positions({"a": .5, "b": .5}, timeout_s=.02)
+    assert all(value == pytest.approx(.25, abs=MODEL_MIT_POSITION_TABLE[MODEL] / 0x7FFF / 2)
+               for value in result.values())
 
 
 @pytest.mark.parametrize("mode", [0, 1, 3])
@@ -581,16 +626,16 @@ def test_bad_status_does_not_update_temperature_and_reconnect_clears(rig):
     assert group.last_status_monotonic_s == {}
 
 
-def test_control_one_deadline_across_both_batches(rig):
+def test_control_one_deadline_for_target_status_batch(rig):
     group, bus, clock = prepared(rig)
     bus.send_cost = .002
     bus.recv_cost = .001
     start = clock.now
     with pytest.raises(TimeoutError):
-        group.send_positions({"a": .5, "b": .5}, timeout_s=.008)
+        group.send_positions({"a": .5, "b": .5}, timeout_s=.006)
     assert clock.now - start <= .008001
     assert group.last_cycle["total_s"] <= .008001
-    assert group.last_error["phase"] == "control:positions"
+    assert group.last_error["phase"] == "control:target_status"
 
 
 @pytest.mark.parametrize("operation", ["control", "disable"])
@@ -653,7 +698,8 @@ def test_enable_and_post_enable_errors_require_explicit_cleanup(rig, change):
             bus.values[2][0x7019] = .5
         return frames
     bus.hook = hook
-    with pytest.raises((KeyboardInterrupt, RuntimeError, ValueError, TimeoutError)):
+    with pytest.raises((KeyboardInterrupt, RuntimeError, ValueError, TimeoutError),
+                       match="status/register" if change == "position" else None):
         group.prepare(limits(group))
     assert kinds(bus).count(3) == 2
     assert kinds(bus).count(4) == 2  # No implicit cleanup commands.
@@ -662,8 +708,8 @@ def test_enable_and_post_enable_errors_require_explicit_cleanup(rig, change):
     assert group.disable(timeout_s=.02) == {"a": None, "b": None}
 
 
-@pytest.mark.parametrize("change", ["reserved_id", "wrong_register", "wrong_host", "wrong_motor"])
-def test_parameter_header_and_reply_correlation_fail_closed(rig, change):
+def test_malformed_parameter_tail_during_control_fails_closed(rig):
+    change = "reserved_id"
     group, bus, _ = prepared(rig)
     bad = reply(2, 0x7019, .25)
     if change == "reserved_id":
@@ -674,8 +720,9 @@ def test_parameter_header_and_reply_correlation_fail_closed(rig, change):
         bad.arbitration_id ^= 1
     else:
         bad = reply(3, 0x7019, .25)
-    bus.hook = lambda request, frames: [bad] if request.arbitration_id >> 24 == 17 and request.arbitration_id & 255 == 2 else frames
-    with pytest.raises(ValueError if change == "reserved_id" else TimeoutError):
+    bus.hook = lambda request, frames: (frames + [bad] if request.arbitration_id >> 24 == 18
+                                        and request.arbitration_id & 255 == 2 else frames)
+    with pytest.raises(ValueError):
         group.send_positions({"a": .5, "b": .5}, timeout_s=.02)
     assert group._failed
 
@@ -790,23 +837,19 @@ def test_pre_enable_hold_matches_latest_disabled_position(rig):
     assert 3 not in kinds(bus) and group._failed
 
 
-@pytest.mark.parametrize("fresh", [True, False])
-def test_old_positions_between_status_and_reads_are_drained(rig, fresh):
+def test_queued_type17_positions_do_not_replace_status_positions(rig):
     group, bus, _ = prepared(rig)
     def hook(request, frames):
         motor = request.arbitration_id & 255
         if request.arbitration_id >> 24 == 18 and motor == 2:
             return frames + [reply(1, 0x7019, -.75), reply(2, 0x7019, -.75)]
-        if request.arbitration_id >> 24 == 17 and not fresh:
-            return []
         return frames
     bus.hook = hook
-    if fresh:
-        assert group.send_positions({"a": .5, "b": .5}, timeout_s=.02) == {"a": .25, "b": .25}
-    else:
-        with pytest.raises(TimeoutError):
-            group.send_positions({"a": .5, "b": .5}, timeout_s=.02)
-    assert [b[0][1] for b in assert_batches(bus.events, 2)] == [18, 17]
+    result = group.send_positions({"a": .5, "b": .5}, timeout_s=.02)
+    assert all(value == pytest.approx(.25, abs=MODEL_MIT_POSITION_TABLE[MODEL] / 0x7FFF / 2)
+               for value in result.values())
+    assert [b[0][1] for b in assert_batches(bus.events, 2)] == [18]
+    assert 17 not in kinds(bus)
 
 
 def test_control_read_batch_with_existing_deadline_always_drains(rig):
@@ -837,9 +880,11 @@ def test_queued_tail_after_final_reply_cannot_succeed(rig, operation, tail):
         if motor == 2:
             if operation == "disable" and kind == 4:
                 return frames + [bad]
-            if kind == 17 and struct.unpack_from("<H", request.data)[0] == 0x7019:
-                if operation == "control" or (operation == "prepare" and 3 in kinds(bus)):
-                    return frames + [bad]
+            if ((operation == "control" and kind == 18) or
+                    (operation == "prepare" and kind == 17 and
+                     struct.unpack_from("<H", request.data)[0] == 0x7019 and
+                     3 in kinds(bus))):
+                return frames + [bad]
         return frames
     bus.hook = hook
     if operation == "disable":
@@ -862,7 +907,9 @@ def test_final_inspection_bounded_and_no_fresh_deadline(rig, operation):
     def hook(request, frames):
         kind = request.arbitration_id >> 24
         if request.arbitration_id & 255 == 2:
-            final = kind == 4 if operation == "disable" else kind == 17 and struct.unpack_from("<H", request.data)[0] == 0x7019
+            final = (kind == 4 if operation == "disable" else
+                     kind == 18 if operation == "control" else
+                     kind == 17 and struct.unpack_from("<H", request.data)[0] == 0x7019)
             if final and (operation != "prepare" or 3 in kinds(bus)):
                 bus.flood = status(3)  # Unrelated, but an undrainable tail.
         return frames
@@ -986,7 +1033,7 @@ def test_final_inspection_cannot_get_another_deadline(rig, operation):
     start = clock.now
     def tail_cost(timeout):
         if timeout == 0. and bus.sent and not bus.queue:
-            if operation == "disable" or kinds(bus)[-1] == 17:
+            if operation == "disable" or kinds(bus)[-1] == 18:
                 # Consume exactly the remaining group budget in the final
                 # nonblocking inspection, not a new per-call timeout.
                 clock.now = start + .02
