@@ -149,3 +149,169 @@ firmware-specific commissioning before real operation.
 
 Tests use only fake CAN transports and a deterministic clock; no sockets or
 hardware are opened.
+
+## Additive group API
+
+Import `CspGroup` explicitly; `csp.py`, `position.py`, and package exports remain
+unchanged. This session owns **one** SocketCAN bus with extended-frame filters
+for the selected motor IDs and host destination:
+
+```python
+from robstride_dynamics.csp_group import CspGroup
+
+# API signatures (not an executable control sequence):
+CspGroup(channel, motor_ids: dict[str, int], bitrate=1000000, host_id=255)
+group.connect()  # No commands.
+group.read_settings(*, timeout_s) -> dict[str, dict]
+group.prepare(limits: dict[str, dict], *, timeout_s=.02, check_cancel=None) -> dict[str, float]
+group.send_positions(targets: dict[str, float], *, timeout_s) -> dict[str, float]
+group.disable(*, timeout_s) -> dict[str, str | None]
+group.last_status_temperature_c  # dict[name, float]
+group.last_status_monotonic_s    # dict[name, float]
+group.close()  # No commands, including after an error.
+```
+
+Both input dictionaries must contain **exactly** the configured motor names.
+Each preparation entry must contain these seven fields: `velocity_limit_rad_s`,
+`current_limit_a`, `torque_limit_nm`, `position_tolerance_rad`,
+`position_min_rad`, `position_max_rad`, and `expected_position_rad`. These are
+six explicit SDK limit fields plus the runtime's expected reference. Runtime
+owners must translate `CspTestLimits.max_tracking_error_rad` to the SDK's
+`position_tolerance_rad`; the other five limit field names match. Passing
+`max_tracking_error_rad` directly is not supported as an SDK alias. The SDK does
+not import runtime code. All arguments are validated before any
+commands. Raw and float32-encoded control targets must lie within `-pi..pi`.
+The approved bounds/expected reference guard preparation snapshots; runtime
+remains responsible for subsequent command bounds and scheduling.
+
+Preparation phases are **group-wide**: disable all and confirm Reset; batch
+read each of the seven settings registers; validate every motor; write mode to
+all; write each of the three limit registers to all; write current raw hold
+targets to all; batch-read settings and hold targets; verify all readbacks and
+position guards; batch-enable all and confirm Motor status; batch-read and
+verify raw positions against the initial and runtime expected references and
+the verified hold-target readback.
+No motor is enabled while another is still being configured. Reported settings
+must have zero state 1, positive limits/watchdog, and a finite raw position on
+the verified branch. Limit increases are refused for both requested and encoded
+values; limit readbacks must exactly match their float32 encoding. Watchdogs
+must remain unchanged. All position snapshots require tolerance clearance
+inside the approved bounds. Before enable, the hold-target readback must also
+be within tolerance of the latest disabled raw-position snapshot, not merely
+within tolerance of the original initial reference. After enable, raw position
+must also be directly within tolerance of the verified hold-target readback,
+in addition to the initial-movement and runtime position guards. Checking both
+values only against the initial reference would otherwise allow them to differ
+by up to twice the tolerance.
+
+Each preparation command/register batch has **one shared deadline**, including
+drain, all sends and all receives, independent of motor count. Successful
+preparation uses 23 such phases, so its total can approach `23 * timeout_s`;
+it is not a single-deadline call. Read-only settings use seven shared register
+deadlines and return the same seven keys as `CspMotor`. Group CSP settings
+validation requires `zero_state=1` and `timeout_s < can_timeout_raw / 20000`.
+The watchdog mapping is nominal, not empirical firmware verification.
+
+A control cycle instead uses **one deadline for the entire call**: drain queued
+traffic; write all targets **without receiving between sends**; collect a
+fault-free Type-2 Motor status from every motor; drain buffered traffic again
+under that same deadline; request all raw positions **without receiving between
+sends**; collect finite register-correlated `0x7019` replies. Each batch also
+performs a bounded, nonblocking queue inspection after its final required reply,
+using the original deadline. This catches selected faults/malformed frames queued
+behind an otherwise complete response; an undrainable tail fails closed. Out-of-order replies are accepted; duplicates cannot confirm
+another motor. Faults or malformed selected status/fault frames fail even when
+queued or received during another motor's register/status phase. Classical
+frame and parameter-header validation matches `position.py`. Control/preparation
+register and command drains/collections have a 4096-frame cap, sufficient for
+12-motor batches but bounded even when a fake/backend clock does not advance.
+Disable pre-drains and tail inspections use the smaller of 256 and the configured
+frame budget; disable status collection uses the configured 4096-frame budget.
+
+`check_cancel()` is called before every preparation send and receive, including
+nonblocking drains. It should raise to abort. Cancellation, transport failures,
+faults, verification failures and interruptions poison the session and revoke
+preparation. Operations reject concurrent callers without interleaving commands.
+Close/connect and prepare again before resuming control.
+
+Accepted command statuses also update `last_status_temperature_c` and
+`last_status_monotonic_s`. Temperature is decoded from the Type-2 `>HHHH`
+payload's final unsigned 16-bit field using the original bus API's exact
+`temperature_u16 * 0.1` °C scale. Only a selected, well-formed, fault-free
+Type-2 status accepted as a still-pending required response to a normal write,
+enable, or control-target batch updates these dictionaries. Queue drains,
+unrelated or duplicate frames, fault frames, malformed frames, and explicit
+or preparation cleanup disable collection do not update them. Thus cleanup
+cannot overwrite the final enabled telemetry. Both dictionaries are cleared
+on every successful `connect()`.
+
+`last_cycle` records SDK `time.monotonic()` timings and control status telemetry:
+
+- `target_send_monotonic_s`: motor-name dictionary recorded immediately after each
+  transport `send()` returns successfully—i.e. after python-can accepts the frame,
+  not before a potentially blocking send attempt. These are host-side submission
+  completion times, not proof of motor receipt or synchronized execution.
+- `target_burst_s`: elapsed target-write burst time (including a failed burst).
+- `status_temperature_c`: a per-cycle name-to-temperature copy populated only by
+  the control target statuses accepted in that cycle.
+- `status_receive_monotonic_s`: matching host monotonic acceptance timestamps.
+- `total_s`: entire control batch duration, also updated on failure.
+
+`last_error` identifies a failing `phase` and ordered `pending_motors` list;
+disable failures list all unconfirmed motors. `last_disable_outcomes` retains
+the most recent explicit disable's name-to-outcome mapping (cleared on connect).
+These are transport diagnostics, not hardware timing or freshness guarantees.
+
+**Cleanup is explicit**, including after cancellation or partial enable. Use a
+separate cleanup budget and always close, even if disable fails:
+
+```python
+group.connect()
+try:
+    positions = group.prepare(limits, check_cancel=check_cancel)
+    # The owner schedules subsequent group.send_positions(...) calls.
+finally:
+    try:
+        outcomes = group.disable(timeout_s=0.1)
+        # None means fault-free Reset was observed; strings mean unconfirmed.
+        # The owner must handle every unconfirmed motor.
+    finally:
+        group.close()
+```
+
+Disable bypasses poison and cancellation. It first establishes a **bounded,
+nonblocking receive-buffer boundary**: drain with `recv(timeout=0)` before sending,
+discarding known buffered Reset replies rather than accepting them as new stop
+acknowledgments. This drain uses at most 256 frames (or a smaller configured
+budget) and the same total deadline as the rest of disable; it never waits for
+traffic. A drain fault is retained for its motor; a failed/undrainable boundary
+makes all confirmations fail closed. **Even if this drain faults, raises an
+interruption, exhausts its frame budget, or consumes the deadline, every disable
+send is still attempted.** Preparation's initial disable uses this same boundary
+and unconditional send-all behavior, and propagates failures before configuration.
+
+No receive occurs **between** disable sends. Send failures do not suppress other
+motors' attempts; expired-budget sends use zero/nonblocking timeout. One total
+deadline covers the pre-drain, all sends, reply collection and final queue
+inspection. In-flight Motor status is skipped while waiting for Reset. Faults,
+malformed replies, send failures and missing replies produce per-motor error
+strings; an error is never overwritten by a later Reset. The final bounded queue
+inspection can override already confirmed motors if faults/malformed frames are
+queued behind the last Reset. An incomplete final inspection fails closed.
+
+Explicit cleanup catches **`BaseException`**, including `KeyboardInterrupt` and
+`SystemExit`, from transport sends/receives and represents it as an error string
+instead of propagating it and skipping another motor's cleanup. Interruptions are
+therefore intentionally suppressed during `disable()`; callers must inspect its
+returned mapping or `last_disable_outcomes` and surface cleanup failures. This
+does not affect propagation of preparation/control interruptions. Confirmed
+motors return `None`; disable does not unpoison a failed session.
+
+The protocol has **no transaction ID**: source/register correlation and drains
+cannot prove that a matching reply is fresh, nor that an observed Reset was
+caused by this disable. In particular, an identical in-flight reply may arrive
+after the receive-buffer boundary; the SDK cannot distinguish it from a new
+reply. CAN frame timestamps are wall-clock values and are not compared with
+SDK `time.monotonic()` deadlines. Snapshots are non-atomic. Use an exclusive bus owner and
+independent hardware safety; no physical safety, installed-firmware, watchdog,
+synchronization or freshness guarantee is claimed.
